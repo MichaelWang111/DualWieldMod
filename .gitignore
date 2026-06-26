@@ -1,1 +1,8 @@
 ideas/
+**/bin/
+**/obj/
+**/refs/
+*.dll
+*.pdb
+*.cache
+*.csproj.user
