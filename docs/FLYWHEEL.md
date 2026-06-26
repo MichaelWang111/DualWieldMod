@@ -209,3 +209,22 @@ Copy this template for each new round.
 - User Feedback: Confirmed in game. Visible log lines included `[DualWieldMod] BattleStart event received`, `[DualWieldMod] Offhand minimal controller started. skillId=IIER7Z, baseId=11452`, and `[DualWieldMod] Offhand fired. count=1/2`. Screenshot showed the extra sword/projectile effect.
 - Decision: Accepted. Runtime visibility is confirmed, and Release build output is the correct default for handoff/testing.
 - Next Round: Start a cleanup/control round: reduce temporary visible tips/log spam, then introduce controlled offhand trigger/loadout behavior without expanding into Q wheel or mastery yet.
+
+### FW-20260627-03 - Add Project README
+
+- Status: Docs Only
+- Date: 2026-06-27
+- User Request: Add a root `README.md` for the GitHub project.
+- Scope: Create a concise project entry document covering project purpose, current runtime status, repository model, sync/build commands, ApiProbe, key docs, next Flywheel step, and upload guardrails.
+- Non-Goals: No MOD gameplay change, no source sync/build, no new runtime test.
+- Files Changed: `README.md`, `docs/FLYWHEEL.md`.
+- Compile Verification:
+  - ApiProbe: Not required for docs-only work.
+  - Real MOD build: Not required for docs-only work.
+- Expected In-Game Behavior: No change.
+- Should Not Happen: No change to MOD runtime behavior, no generated files committed, no `ideas/` upload.
+- User Test Checklist:
+  - [ ] Review README on GitHub/local repo for clarity.
+- User Feedback: Pending.
+- Decision: README added as project entrypoint.
+- Next Round: `FW-20260627-04 - Cleanup And Controlled Offhand Trigger` when ready.
