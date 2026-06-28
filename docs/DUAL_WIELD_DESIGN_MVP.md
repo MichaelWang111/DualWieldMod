@@ -26,6 +26,8 @@ This is a working synchronous dual attack seed, but it is too direct: one offhan
 Only normal attacks can dual wield.
 
 - Left click / normal attack channel: main normal attack plus optional offhand normal attack.
+- If no offhand was explicitly selected, left click must trigger only the main normal attack. The MOD must not copy main into offhand as a fallback.
+- If main is empty but offhand is selected when battle starts, the offhand should be promoted to main and the offhand slot cleared.
 - Right click: unique skill channel, not offhand attack.
 - Movement skill: switchable but not dual wielded.
 - Divine skill: switchable but not dual wielded.
@@ -39,9 +41,56 @@ Each wheel candidate pool supports 0 to 6 entries. The upper limit is fixed for 
 
 Unique, movement, and divine skills do not dual wield. They may be switched in combat, but each category should use shared cooldown so the player cannot chain several high-impact skills by rotating the pool.
 
+## Skill Trigger Consistency Contract
+
+A switched or secondary skill is not correct merely because it produces the expected projectile or damage. Each triggered skill must remain internally consistent across the full game combat chain.
+
+For any skill trigger, the following must point to the same learned skill instance or to a documented category-specific runtime object derived from that instance:
+
+```text
+selected learned skill instance
+= runtime object that creates the visual/projectile/damage
+= runtime object that owns cooldown state
+= runtime object that checks and spends resource cost
+= SkillCreateData / MissileShotData source context
+= hit/effect/buff attribution source
+= learned ActionMartialData or category data that receives experience/proficiency
+= UI/input/action state that believes this skill is active
+```
+
+For normal attacks and likely right-click unique skills, the core lower-level check is:
+
+```text
+visual/projectile SkillAttack
+= cooldown SkillAttack
+= SkillDataAttack.actionMartialData
+= ActionMartialData that should gain experience
+```
+
+That lower-level check is necessary but not sufficient. The contract also includes `SkillDataAttack.mpCost`, `SkillAttack.IsCost()`, `BattleSkillValueData`, `SkillCreateData.createSkillBase`, `SkillCreateData.mainSkillID`, `MissileShotData.skillCreateData`, effect trigger state, and the player input/action cache.
+
+Current risk for the MVP offhand path: `SkillAttack.Create(...)` is runtime-proven to create a second attack and damage instance, but it is not yet proven to add experience to the offhand skill. It may add no experience, add experience to the main skill, or require a separate original API call such as `UnitCtrlPlayer.AddSkillMartialExp(...)`. `DWT-022` must answer this before combat wheel switching or mastery growth is treated as complete.
+
+## Runtime Skill Categories
+
+The MOD must not assume every combat category is represented by the same runtime object.
+
+- Normal attack: current implementation uses `SkillAttack` with `SkillDataAttack` and learned `ActionMartialData` from `allActionMartial`.
+- Unique skill: right-click is its own skill channel. Metadata shows `UnitPlayerInputCtrl.UseSkill(MartialType)` and `UnitCtrlPlayer.CreateSkillAttack(MartialType)`, so it may share parts of the `SkillAttack` path, but switching and shared cooldown still need runtime proof.
+- Movement skill: metadata shows `StepBase` with `IsCreate()`, `IsCost()`, `Create()`, `OnCreate(SkillCreateData)`, and `isUseStep`. It is not a normal `SkillAttack`.
+- Divine/ultimate skill: metadata shows `CreateUltimate(...)`, `unit.ultimate`, and `AIHumanState.ActionUltimate`; it needs its own switch and cooldown proof.
+- Field, god-eye, immortal, ability, and other special systems have separate runtime objects such as `FieldSkillBase`, `GodEyeSkillBase`, `ImmortalSkillBase`, and `AbilityBase`.
+
+Therefore the normal-attack dual wield implementation should be validated first. Non-normal combat switching must get a category-specific probe and cannot inherit correctness from the normal `SkillAttack` offhand proof.
+
 ## Wheel Interaction
 
-The wheel is a combat selection surface, not an inventory screen.
+The wheel system has two surfaces:
+
+1. Prebattle setup UI in the player skill interface, used to configure 0-6 candidates.
+2. Combat Q wheel, used to quickly select from those prepared candidates.
+
+The combat wheel is a selection surface, not an inventory screen. It should only show the prepared candidate pool.
 
 Normal attack wheel rules:
 
@@ -64,6 +113,18 @@ The same 0-6 candidate limit applies to all wheel categories. Layout should be s
 - 4: cross layout.
 - 5: five-point layout.
 - 6: six-point layout.
+
+Prebattle normal setup MVP:
+
+- Add a compact six-slot candidate strip or small preview near the normal attack/offhand area of the player skill UI.
+- Store candidate ids as learned skill instance ids.
+- Clicking an empty candidate slot stores the current main normal attack into that slot.
+- Clicking a filled slot with a different current main replaces the slot.
+- Clicking a filled slot with no current main clears the slot.
+- Editing the candidate pool must not automatically replace main or offhand.
+- The candidate pool persists independently of the current main and offhand slots.
+
+See `docs/WHEEL_DESIGN.md` for the current detailed wheel architecture.
 
 ## Dual Wield Eligibility
 
@@ -238,6 +299,8 @@ pattern_mastery_v1
 wheel_config_v1
 ```
 
+During early wheel work, it is acceptable to keep `offhandSkillId` as a separate compatibility key and add a narrow `normalWheelPool_v1` key for the ordered normal candidate ids. The implementation should wrap this behind a store class so it can later migrate into `wheel_config_v1`.
+
 Example mastery JSON shape:
 
 ```json
@@ -272,6 +335,10 @@ Example loadout JSON shape:
 ```
 
 MVP can continue storing the offhand string separately for compatibility during early refactor, but the target shape should use versioned JSON blobs.
+
+Important guardrail: an empty `offhandSkillId` means offhand mode is disabled. Do not bootstrap it from current main on battle start.
+
+Second guardrail: if `skillLeft` is empty but `offhandSkillId` is valid on battle start, promote `offhandSkillId` into `skillLeft` and clear `offhandSkillId`. This preserves a usable single-hand loadout without creating a same-skill double hit.
 
 ## MVP Scope
 
@@ -435,9 +502,10 @@ A prototype is good enough when the following can be observed in battle:
 5. Add combat stamina and stage calculation.
 6. Add offhand delay and instability inside `DualAttackController`.
 7. Add minimal debug logging or tips for current stage.
-8. Prototype normal attack wheel only.
-9. Verify input blocking and hover/click semantics.
-10. Only after that, investigate unique/movement/divine switching and shared cooldowns.
+8. Add prebattle normal candidate setup UI in the player skill interface.
+9. Prototype normal attack Q wheel shell only.
+10. Verify input blocking and hover/click semantics.
+11. Only after that, investigate unique/movement/divine switching and shared cooldowns.
 
 ## Notes On Balance
 

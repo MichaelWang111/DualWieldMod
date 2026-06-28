@@ -1,4 +1,4 @@
----
+﻿---
 name: dual-wield-mod-dev
 description: Project-local agent instructions for DualWieldMod. Use when implementing, syncing, building, committing, or uploading the Tale of Immortal / Guigubahuang dual-wield MOD from the clean GitHub repo into the real game-generated MOD project without committing generated files, raw ideas, binaries, caches, or game-project artifacts.
 ---
@@ -22,6 +22,7 @@ The GitHub repo is the clean source of truth. The game-generated project is a de
 
 Allowed tracked areas:
 
+- `README.md`: project entrypoint.
 - `src/`: source overlay that may be synced into the real MOD project.
 - `docs/`: design, API research, handoff, AI context.
 - `tools/`: deterministic helper scripts.
@@ -31,6 +32,8 @@ Allowed tracked areas:
 Forbidden tracked areas:
 
 - `ideas/`
+- `resource/`
+- `generated/`
 - Anything under `D:\Games\mods\guigubahuang\ModProject_h6Zv8g`
 - `bin/`, `obj/`, `refs/`
 - `*.dll`, `*.pdb`, `*.cache`, `*.csproj.user`
@@ -50,24 +53,27 @@ Do not copy the full game-generated project into `src/`. Do not import template 
 
 ## Development Workflow
 
-1. Read `docs/AI_CONTEXT.md`, `docs/DATA_FIELD_RESEARCH.md`, and `docs/FLYWHEEL.md` before implementing.
-2. For code-bearing work, create or update a Flywheel record before editing. The round must end with real project compile results, expected in-game behavior, a user test checklist, and status `Awaiting Game Test` unless blocked.
-3. Edit clean source under `src/` first.
-4. Dry-run sync:
+1. Read `docs/AI_CONTEXT.md`, `docs/DATA_FIELD_RESEARCH.md`, `docs/FLYWHEEL.md`, and `docs/SERIAL_TEST_PLAN.md` before implementing.
+2. For uncertain game-kernel symbols, first decide the track: `AIT` validates tool capability, `KEP` answers narrow combat evidence questions, and `DWT` changes or traces real gameplay behavior.
+3. For AIT/KEP, use the offline tools in this order when relevant: `tools/index-ggbh-api-chm.ps1`, `tools/inventory-dotnet-assemblies.ps1`, `tools/inspect-combat-system.ps1`, `tools/decompile-dotnet-assembly.ps1`, `tools/export-dnspy-types.ps1`, `tools/index-resource-knowledge.ps1`, then `test/ApiProbe`. These write local reproducible output to ignored `generated/`.
+4. For code-bearing work, create or update a Flywheel record in `docs/FLYWHEEL_LOG.md` before editing. Bind runtime behavior to one or more `DWT-###` test IDs. The round must end with real project compile results, expected in-game behavior, a user test checklist, and status `Awaiting Game Test` unless blocked.
+5. Edit clean source under `src/` first.
+6. Dry-run sync:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\sync-src-to-game.ps1
 ```
 
-5. Apply sync and build:
+7. Apply sync and build:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\sync-src-to-game.ps1 -Apply -Build
 ```
 
-6. If build fails, fix `src/` and sync again. Do not patch generated `bin/obj` outputs.
-7. If new API facts are discovered, update `docs/DATA_FIELD_RESEARCH.md` or `docs/AI_CONTEXT.md`.
-8. Stop after handoff while runtime status is unverified; the user tests in game and reports feedback for the next Flywheel round.
+8. If build fails, fix `src/` and sync again. Do not patch generated `bin/obj` outputs.
+9. If new API facts are discovered, update `docs/DATA_FIELD_RESEARCH.md` or `docs/AI_CONTEXT.md`.
+10. Stop after handoff while runtime status is unverified; the user tests in game and reports feedback for the next Flywheel round.
+11. When feedback arrives, update `docs/FLYWHEEL_LOG.md`; update `docs/SERIAL_TEST_PLAN.md` only when a serial test status or evidence changes.
 
 ## Upload Workflow
 
@@ -78,18 +84,20 @@ Before committing:
 ```powershell
 git status --short
 git diff --check
-git diff -- .gitignore dual_wield_mod_skill.md docs src tools test
+git diff -- README.md .gitignore dual_wield_mod_skill.md docs src tools test
 ```
 
 Stage only allowed paths:
 
 ```powershell
-git add .gitignore dual_wield_mod_skill.md docs src tools test
+git add README.md .gitignore dual_wield_mod_skill.md docs src tools test
 git status --short
 git diff --cached --name-only
 ```
 
 Reject the commit if staged files include forbidden paths or generated artifacts. Then commit and push:
+
+Never stage `resource/` or `generated/`, even when they contain useful local evidence. Record only concise conclusions and reproducible commands in tracked docs.
 
 ```powershell
 git commit -m "<clear message>"
@@ -108,9 +116,23 @@ dotnet build "D:\Games\mods\guigubahuang\ModProject_h6Zv8g\ModProject\ModCode\Mo
 
 Warnings about unused template references may be acceptable if the build has `0 error` and the touched code does not depend on those missing assemblies.
 
+Ignore the known 6-warning baseline in routine reports when these are the only warnings:
+
+- `com.unity.multiplayer-hlapi.Runtime`
+- `DOTweenPro`
+- `UnityEngine.GridModule`
+- `UnityEngine.TerrainModule`
+- `UnityEngine.VRModule`
+- `UnityEngine.XRModule`
+
+If the warning set changes or any error appears, report it explicitly.
+
 ## Current Known Gaps
 
 Do not claim these APIs are confirmed until a compile or runtime probe proves them:
+
+Offline CHM/Cecil/dnSpy evidence can promote a symbol to candidate, but not to runtime-confirmed behavior.
+Managed DLL dnSpy output can include full function bodies; IL2CPP wrapper/stub output still needs Cecil body coverage checks before treating it as logic evidence.
 
 - Learned skill instance current mastery/proficiency field.
 - Battle-safe current/max `mp` and `sp` read/write API.

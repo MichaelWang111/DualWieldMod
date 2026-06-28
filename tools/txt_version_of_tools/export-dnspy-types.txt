@@ -1,0 +1,222 @@
+﻿[CmdletBinding()]
+param(
+    [string[]]$TypeName = @(
+        "UnitCtrlPlayer",
+        "BattleDataMgr",
+        "UnitActionRoleBattle",
+        "SkillAttack",
+        "SkillBase",
+        "SkillDataAttack",
+        "MartialTool",
+        "DataUnit"
+    ),
+    [string]$AssemblyPath,
+    [string]$DnSpyRoot = "",
+    [string]$OutputDir,
+    [switch]$UseManagedAssembly,
+    [switch]$LanguageIL
+)
+
+$ErrorActionPreference = "Stop"
+
+$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = (Resolve-Path (Join-Path $ScriptRoot "..")).Path
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $OutputDir = Join-Path $RepoRoot "generated\dnspy-types"
+}
+
+function Get-SafeFileName {
+    param([string]$Name)
+    $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+    $safe = $Name
+    foreach ($ch in $invalid) {
+        $safe = $safe.Replace($ch, '_')
+    }
+    return $safe.Replace('/', '.').Replace('+', '.')
+}
+
+function Find-DnSpyConsoleDll {
+    param([string]$Root)
+    $candidateRoots = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($Root)) {
+        [void]$candidateRoots.Add($Root)
+    }
+    $envRoot = [Environment]::GetEnvironmentVariable("DNSPY_ROOT")
+    if (-not [string]::IsNullOrWhiteSpace($envRoot)) {
+        [void]$candidateRoots.Add($envRoot)
+    }
+    foreach ($scanRoot in @("D:\Games\tools", "D:\Games")) {
+        if (Test-Path -LiteralPath $scanRoot -PathType Container) {
+            $foundRoot = Get-ChildItem -LiteralPath $scanRoot -Directory -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "bin\dnSpy.Console.dll") -PathType Leaf } |
+                Select-Object -First 1 -ExpandProperty FullName
+            if ($foundRoot) {
+                [void]$candidateRoots.Add($foundRoot)
+                break
+            }
+        }
+    }
+
+    foreach ($candidateRoot in $candidateRoots) {
+        $candidate = Join-Path $candidateRoot "bin\dnSpy.Console.dll"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+
+        if (Test-Path -LiteralPath $candidateRoot -PathType Container) {
+            $found = Get-ChildItem -LiteralPath $candidateRoot -Recurse -Filter "dnSpy.Console.dll" -File -ErrorAction SilentlyContinue |
+                Select-Object -First 1 -ExpandProperty FullName
+            if ($found) {
+                return (Resolve-Path -LiteralPath $found).Path
+            }
+        }
+    }
+
+    return $null
+}
+
+function Find-GameRoot {
+    foreach ($commonRoot in @("D:\Games\Steam\steamapps\common", "C:\Program Files (x86)\Steam\steamapps\common")) {
+        if (-not (Test-Path -LiteralPath $commonRoot -PathType Container)) { continue }
+        $managed = Get-ChildItem -LiteralPath $commonRoot -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName "MelonLoader\Managed\Assembly-CSharp.dll" } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+        if ($managed) {
+            return (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $managed)))
+        }
+    }
+    return $null
+}
+
+function Find-Assembly {
+    param([bool]$PreferManaged)
+
+    $gameRoot = Find-GameRoot
+    if ($gameRoot) {
+        $managed = Join-Path $gameRoot "MelonLoader\Managed\Assembly-CSharp.dll"
+        $cpp2il = Join-Path $gameRoot "MelonLoader\Dependencies\Il2CppAssemblyGenerator\Cpp2IL\cpp2il_out\Assembly-CSharp.dll"
+        if ($PreferManaged) {
+            if (Test-Path -LiteralPath $managed -PathType Leaf) { return (Resolve-Path -LiteralPath $managed).Path }
+            if (Test-Path -LiteralPath $cpp2il -PathType Leaf) { return (Resolve-Path -LiteralPath $cpp2il).Path }
+        } else {
+            if (Test-Path -LiteralPath $cpp2il -PathType Leaf) { return (Resolve-Path -LiteralPath $cpp2il).Path }
+            if (Test-Path -LiteralPath $managed -PathType Leaf) { return (Resolve-Path -LiteralPath $managed).Path }
+        }
+    }
+
+    foreach ($envName in @("GGBH_MANAGED_DIR", "GAME_MANAGED_DIR", "DUALWIELDMOD_MANAGED_DIR")) {
+        $value = [Environment]::GetEnvironmentVariable($envName)
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        $candidate = Join-Path $value "Assembly-CSharp.dll"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+
+    return $null
+}
+
+function Find-AssemblySearchPaths {
+    param([string]$Assembly)
+    $paths = [System.Collections.Generic.List[string]]::new()
+    $gameRoot = Find-GameRoot
+    $assemblyDir = Split-Path -Parent $Assembly
+    foreach ($path in @(
+        $assemblyDir,
+        (Join-Path (Split-Path -Parent $assemblyDir) "UnityDependencies"),
+        (Join-Path $gameRoot "MelonLoader\Managed"),
+        (Join-Path $gameRoot "MelonLoader"),
+        (Join-Path $gameRoot "MelonLoader\Dependencies\Il2CppAssemblyGenerator\UnityDependencies")
+    )) {
+        if ((-not [string]::IsNullOrWhiteSpace($path)) -and (Test-Path -LiteralPath $path -PathType Container)) {
+            $resolved = (Resolve-Path -LiteralPath $path).Path
+            if (-not $paths.Contains($resolved)) { [void]$paths.Add($resolved) }
+        }
+    }
+    return $paths.ToArray()
+}
+
+$dnSpyConsole = Find-DnSpyConsoleDll $DnSpyRoot
+if ([string]::IsNullOrWhiteSpace($dnSpyConsole)) {
+    throw "dnSpy.Console.dll was not found. Pass -DnSpyRoot or set DNSPY_ROOT."
+}
+
+if ([string]::IsNullOrWhiteSpace($AssemblyPath)) {
+    $AssemblyPath = Find-Assembly ([bool]$UseManagedAssembly)
+}
+if ([string]::IsNullOrWhiteSpace($AssemblyPath) -or -not (Test-Path -LiteralPath $AssemblyPath -PathType Leaf)) {
+    throw "Assembly-CSharp.dll was not found. Pass -AssemblyPath."
+}
+$AssemblyPath = (Resolve-Path -LiteralPath $AssemblyPath).Path
+
+New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+$searchPaths = Find-AssemblySearchPaths $AssemblyPath
+$asmPathArg = ($searchPaths -join ';')
+$language = if ($LanguageIL) { "IL" } else { "C#" }
+$extension = if ($LanguageIL) { ".il" } else { ".cs" }
+
+$manifest = [System.Collections.Generic.List[object]]::new()
+$expandedTypes = [System.Collections.Generic.List[string]]::new()
+foreach ($rawType in $TypeName) {
+    if ([string]::IsNullOrWhiteSpace($rawType)) { continue }
+    foreach ($part in ($rawType -split ',')) {
+        $trimmed = $part.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+            [void]$expandedTypes.Add($trimmed)
+        }
+    }
+}
+
+foreach ($type in $expandedTypes) {
+    if ([string]::IsNullOrWhiteSpace($type)) { continue }
+    $safeName = Get-SafeFileName $type
+    $outFile = Join-Path $OutputDir ($safeName + $extension)
+    $errFile = Join-Path $OutputDir ($safeName + ".stderr.txt")
+
+    $args = @(
+        $dnSpyConsole,
+        "--no-color",
+        "--asm-path",
+        $asmPathArg,
+        "-l",
+        $language,
+        "-t",
+        $type,
+        $AssemblyPath
+    )
+
+    Write-Host "Exporting $type -> $outFile" -ForegroundColor Cyan
+    & dotnet @args 1> $outFile 2> $errFile
+    $exitCode = $LASTEXITCODE
+    $stderrLength = if (Test-Path -LiteralPath $errFile -PathType Leaf) { (Get-Item -LiteralPath $errFile).Length } else { 0 }
+    if ($stderrLength -eq 0) {
+        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+        $errFile = $null
+    }
+
+    $manifest.Add([pscustomobject]@{
+        typeName = $type
+        output = $outFile
+        stderr = $errFile
+        exitCode = $exitCode
+    })
+
+    if ($exitCode -ne 0) {
+        Write-Host "  dnSpy export returned exit code $exitCode" -ForegroundColor Yellow
+    }
+}
+
+$manifestPath = Join-Path $OutputDir "manifest.json"
+[pscustomobject]@{
+    generatedAt = (Get-Date).ToString("o")
+    dnSpyConsole = $dnSpyConsole
+    assemblyPath = $AssemblyPath
+    assemblySearchPaths = $searchPaths
+    language = $language
+    exports = $manifest
+} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+Write-Host "dnSpy type export complete:" -ForegroundColor Green
+Write-Host "  $OutputDir"
+Write-Host "  $manifestPath"

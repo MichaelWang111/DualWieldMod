@@ -1,0 +1,274 @@
+﻿[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$AssemblyPath,
+    [string]$OutputDir,
+    [string[]]$TypeName = @(),
+    [string[]]$MemberToken = @(),
+    [switch]$FullAssembly,
+    [ValidateSet("C#", "IL")]
+    [string]$Language = "C#",
+    [string[]]$AssemblySearchPath = @(),
+    [string]$DnSpyRoot = ""
+)
+
+$ErrorActionPreference = "Stop"
+
+$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = (Resolve-Path (Join-Path $ScriptRoot "..")).Path
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $OutputDir = Join-Path $RepoRoot "generated\dnspy-decompile"
+}
+
+function Add-ExistingDir {
+    param(
+        [System.Collections.Generic.List[string]]$Dirs,
+        [string]$Path
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $resolved = (Resolve-Path -LiteralPath $Path).Path
+        if (-not $Dirs.Contains($resolved)) { [void]$Dirs.Add($resolved) }
+    }
+}
+
+function Add-ExistingFile {
+    param(
+        [System.Collections.Generic.List[string]]$Files,
+        [string]$Path
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $resolved = (Resolve-Path -LiteralPath $Path).Path
+        if (-not $Files.Contains($resolved)) { [void]$Files.Add($resolved) }
+    }
+}
+
+function Find-DnSpyConsoleDll {
+    param([string]$Root)
+    $candidateRoots = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($Root)) { [void]$candidateRoots.Add($Root) }
+    $envRoot = [Environment]::GetEnvironmentVariable("DNSPY_ROOT")
+    if (-not [string]::IsNullOrWhiteSpace($envRoot)) { [void]$candidateRoots.Add($envRoot) }
+    foreach ($scanRoot in @("D:\Games\tools", "D:\Games")) {
+        if (Test-Path -LiteralPath $scanRoot -PathType Container) {
+            $foundRoot = Get-ChildItem -LiteralPath $scanRoot -Directory -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "bin\dnSpy.Console.dll") -PathType Leaf } |
+                Select-Object -First 1 -ExpandProperty FullName
+            if ($foundRoot) {
+                [void]$candidateRoots.Add($foundRoot)
+                break
+            }
+        }
+    }
+
+    foreach ($candidateRoot in $candidateRoots) {
+        $candidate = Join-Path $candidateRoot "bin\dnSpy.Console.dll"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return (Resolve-Path -LiteralPath $candidate).Path }
+        if (Test-Path -LiteralPath $candidateRoot -PathType Container) {
+            $found = Get-ChildItem -LiteralPath $candidateRoot -Recurse -Filter "dnSpy.Console.dll" -File -ErrorAction SilentlyContinue |
+                Select-Object -First 1 -ExpandProperty FullName
+            if ($found) { return (Resolve-Path -LiteralPath $found).Path }
+        }
+    }
+    return $null
+}
+
+function Find-GameRoot {
+    foreach ($commonRoot in @("D:\Games\Steam\steamapps\common", "C:\Program Files (x86)\Steam\steamapps\common")) {
+        if (-not (Test-Path -LiteralPath $commonRoot -PathType Container)) { continue }
+        $managed = Get-ChildItem -LiteralPath $commonRoot -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName "MelonLoader\Managed\Assembly-CSharp.dll" } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+        if ($managed) { return (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $managed))) }
+    }
+    return $null
+}
+
+function Get-SafeFileName {
+    param([string]$Name)
+    $safe = $Name
+    foreach ($ch in [System.IO.Path]::GetInvalidFileNameChars()) { $safe = $safe.Replace($ch, '_') }
+    return $safe.Replace('/', '.').Replace('+', '.').Replace(':', '_')
+}
+
+function Count-Files {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return 0 }
+    return (Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
+}
+
+function New-SourceManifest {
+    param(
+        [string]$Path,
+        [string]$ManifestPath
+    )
+    $sourceFiles = @(Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -ieq ".cs" })
+    $typeRows = [System.Collections.Generic.List[object]]::new()
+    $namespaceRows = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($file in $sourceFiles) {
+        try { $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8) } catch { continue }
+        $relativePath = $file.FullName.Substring($Path.Length).TrimStart('\')
+        $namespaces = @([regex]::Matches($text, '^\s*namespace\s+([A-Za-z_][\w\.]*)', 'Multiline') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+        foreach ($namespace in $namespaces) {
+            [void]$namespaceRows.Add([pscustomobject]@{ namespace = $namespace; file = $relativePath })
+        }
+
+        $typeRegex = '^\s*(?:(?:public|private|protected|internal|static|sealed|abstract|partial|unsafe|readonly|new)\s+)*(class|struct|interface|enum|delegate)\s+([A-Za-z_][\w`]*)'
+        foreach ($match in [regex]::Matches($text, $typeRegex, 'Multiline')) {
+            [void]$typeRows.Add([pscustomobject]@{
+                kind = $match.Groups[1].Value
+                name = $match.Groups[2].Value
+                namespaces = $namespaces
+                file = $relativePath
+            })
+        }
+    }
+
+    $summary = [pscustomobject]@{
+        generatedAt = (Get-Date).ToString("o")
+        root = $Path
+        sourceFileCount = $sourceFiles.Count
+        namespaceCount = @($namespaceRows | Select-Object -ExpandProperty namespace -Unique).Count
+        typeCount = $typeRows.Count
+        namespaces = @($namespaceRows | Group-Object namespace | Sort-Object Name | ForEach-Object { [pscustomobject]@{ namespace = $_.Name; fileCount = $_.Count } })
+        types = $typeRows
+    }
+    $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
+    return $summary
+}
+
+if (-not (Test-Path -LiteralPath $AssemblyPath -PathType Leaf)) { throw "AssemblyPath not found: $AssemblyPath" }
+$AssemblyPath = (Resolve-Path -LiteralPath $AssemblyPath).Path
+$dnSpyConsole = Find-DnSpyConsoleDll $DnSpyRoot
+if ([string]::IsNullOrWhiteSpace($dnSpyConsole)) { throw "dnSpy.Console.dll was not found. Pass -DnSpyRoot or set DNSPY_ROOT." }
+
+$searchPaths = [System.Collections.Generic.List[string]]::new()
+Add-ExistingDir $searchPaths (Split-Path -Parent $AssemblyPath)
+foreach ($dir in $AssemblySearchPath) { Add-ExistingDir $searchPaths $dir }
+Add-ExistingDir $searchPaths (Join-Path $RepoRoot "resource\app\MelonLoader")
+Add-ExistingDir $searchPaths (Join-Path $RepoRoot "resource\app\MelonLoader\Managed")
+Add-ExistingDir $searchPaths (Join-Path $RepoRoot "resource\app\MelonLoader\Dependencies\Il2CppAssemblyGenerator\UnityDependencies")
+Add-ExistingDir $searchPaths (Join-Path $RepoRoot "resource\app\MelonLoader\Dependencies\Il2CppAssemblyGenerator\Cpp2IL\cpp2il_out")
+$gameRoot = Find-GameRoot
+if ($gameRoot) {
+    Add-ExistingDir $searchPaths (Join-Path $gameRoot "MelonLoader")
+    Add-ExistingDir $searchPaths (Join-Path $gameRoot "MelonLoader\Managed")
+    Add-ExistingDir $searchPaths (Join-Path $gameRoot "MelonLoader\Dependencies\Il2CppAssemblyGenerator\UnityDependencies")
+}
+$asmPathArg = ($searchPaths.ToArray() -join ';')
+$languageArg = if ($Language -eq "IL") { "IL" } else { "C#" }
+$extension = if ($Language -eq "IL") { ".il" } else { ".cs" }
+
+New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+$exports = [System.Collections.Generic.List[object]]::new()
+
+function Invoke-DnSpyExport {
+    param(
+        [string[]]$CommandArgs,
+        [string]$StdoutFile,
+        [string]$StderrFile
+    )
+    & dotnet @CommandArgs 1> $StdoutFile 2> $StderrFile
+    $exitCode = $LASTEXITCODE
+    $stderrLength = if (Test-Path -LiteralPath $StderrFile -PathType Leaf) { (Get-Item -LiteralPath $StderrFile).Length } else { 0 }
+    if ($stderrLength -eq 0) {
+        Remove-Item -LiteralPath $StderrFile -Force -ErrorAction SilentlyContinue
+        $StderrFile = $null
+    }
+    return [pscustomobject]@{ exitCode = $exitCode; stderr = $StderrFile }
+}
+
+foreach ($rawType in $TypeName) {
+    foreach ($type in ($rawType -split ',')) {
+        $trimmed = $type.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        $safeName = Get-SafeFileName $trimmed
+        $outFile = Join-Path $OutputDir ($safeName + $extension)
+        $errFile = Join-Path $OutputDir ($safeName + ".stderr.txt")
+        $args = @($dnSpyConsole, "--no-color", "--asm-path", $asmPathArg, "-l", $languageArg, "-t", $trimmed, $AssemblyPath)
+        Write-Host "Exporting type $trimmed -> $outFile" -ForegroundColor Cyan
+        $result = Invoke-DnSpyExport $args $outFile $errFile
+        [void]$exports.Add([pscustomobject]@{
+            kind = "type"
+            selector = $trimmed
+            output = $outFile
+            stderr = $result.stderr
+            exitCode = $result.exitCode
+        })
+    }
+}
+
+foreach ($rawToken in $MemberToken) {
+    foreach ($token in ($rawToken -split ',')) {
+        $trimmed = $token.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        $safeName = Get-SafeFileName $trimmed
+        $outFile = Join-Path $OutputDir ("metadata_" + $safeName + $extension)
+        $errFile = Join-Path $OutputDir ("metadata_" + $safeName + ".stderr.txt")
+        $args = @($dnSpyConsole, "--no-color", "--asm-path", $asmPathArg, "-l", $languageArg, "--md", $trimmed, $AssemblyPath)
+        Write-Host "Exporting metadata token $trimmed -> $outFile" -ForegroundColor Cyan
+        $result = Invoke-DnSpyExport $args $outFile $errFile
+        [void]$exports.Add([pscustomobject]@{
+            kind = "metadata-token"
+            selector = $trimmed
+            output = $outFile
+            stderr = $result.stderr
+            exitCode = $result.exitCode
+        })
+    }
+}
+
+$fullAssemblyOutput = $null
+$fullAssemblyExitCode = $null
+$fullAssemblyStderr = $null
+$fullAssemblySourceManifestPath = $null
+$fullAssemblySourceManifest = $null
+if ($FullAssembly) {
+    $assemblyName = [System.IO.Path]::GetFileNameWithoutExtension($AssemblyPath)
+    $fullAssemblyOutput = Join-Path $OutputDir (Get-SafeFileName $assemblyName)
+    $fullAssemblyStderr = Join-Path $OutputDir ($assemblyName + ".full.stderr.txt")
+    New-Item -ItemType Directory -Force -Path $fullAssemblyOutput | Out-Null
+    $stdoutSink = Join-Path $OutputDir ($assemblyName + ".full.stdout.txt")
+    $args = @($dnSpyConsole, "--no-color", "--asm-path", $asmPathArg, "-l", $languageArg, "-o", $fullAssemblyOutput, "--no-resources", "--no-resx", "--no-baml", $AssemblyPath)
+    Write-Host "Exporting full assembly -> $fullAssemblyOutput" -ForegroundColor Cyan
+    $result = Invoke-DnSpyExport $args $stdoutSink $fullAssemblyStderr
+    $fullAssemblyExitCode = $result.exitCode
+    $fullAssemblyStderr = $result.stderr
+    if ((Test-Path -LiteralPath $stdoutSink -PathType Leaf) -and (Get-Item -LiteralPath $stdoutSink).Length -eq 0) {
+        Remove-Item -LiteralPath $stdoutSink -Force -ErrorAction SilentlyContinue
+    }
+    if (($fullAssemblyExitCode -eq 0) -and (Test-Path -LiteralPath $fullAssemblyOutput -PathType Container)) {
+        $fullAssemblySourceManifestPath = Join-Path $OutputDir "source-manifest.json"
+        $fullAssemblySourceManifest = New-SourceManifest $fullAssemblyOutput $fullAssemblySourceManifestPath
+    }
+}
+
+$manifestPath = Join-Path $OutputDir "manifest.json"
+[pscustomobject]@{
+    generatedAt = (Get-Date).ToString("o")
+    dnSpyConsole = $dnSpyConsole
+    assemblyPath = $AssemblyPath
+    assemblySearchPaths = $searchPaths.ToArray()
+    language = $languageArg
+    fullAssembly = if ($FullAssembly) {
+        [pscustomobject]@{
+            output = $fullAssemblyOutput
+            stderr = $fullAssemblyStderr
+            exitCode = $fullAssemblyExitCode
+            fileCount = Count-Files $fullAssemblyOutput
+            sourceManifest = $fullAssemblySourceManifestPath
+            sourceFileCount = if ($fullAssemblySourceManifest) { $fullAssemblySourceManifest.sourceFileCount } else { 0 }
+            namespaceCount = if ($fullAssemblySourceManifest) { $fullAssemblySourceManifest.namespaceCount } else { 0 }
+            typeCount = if ($fullAssemblySourceManifest) { $fullAssemblySourceManifest.typeCount } else { 0 }
+        }
+    } else { $null }
+    exports = $exports
+} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+Write-Host "dnSpy decompile complete:" -ForegroundColor Green
+Write-Host "  $OutputDir"
+Write-Host "  $manifestPath"
+

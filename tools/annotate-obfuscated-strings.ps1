@@ -1,0 +1,468 @@
+﻿[CmdletBinding()]
+param(
+    [string]$AssemblyPath,
+    [string]$InputDir,
+    [string]$OutputDir,
+    [string[]]$AssemblySearchPath = @(),
+    [string]$DecoderType = "KBR.nBB",
+    [string]$DecoderMethod = "xBl",
+    [string]$DecoderGuardField = "KR9",
+    [int]$DecoderGuardValue = 75,
+    [string]$CallPrefix = "nBB.xBl",
+    [switch]$UseDotnetHost,
+    [string]$DotnetHostProject = ""
+)
+
+$ErrorActionPreference = "Stop"
+
+$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = (Resolve-Path (Join-Path $ScriptRoot "..")).Path
+if ([string]::IsNullOrWhiteSpace($AssemblyPath)) {
+    $AssemblyPath = Join-Path $RepoRoot "resource\Mod解包结果\SaiLL.dll"
+}
+if ([string]::IsNullOrWhiteSpace($InputDir)) {
+    $InputDir = Join-Path $RepoRoot "generated\ait\AIT-002\SaiLL\SaiLL"
+}
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $OutputDir = Join-Path $RepoRoot "generated\ait\AIT-006-string-annotations\SaiLL"
+}
+
+function Add-ExistingDir {
+    param(
+        [System.Collections.Generic.List[string]]$Dirs,
+        [string]$Path
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $resolved = (Resolve-Path -LiteralPath $Path).Path
+        if (-not $Dirs.Contains($resolved)) { [void]$Dirs.Add($resolved) }
+    }
+}
+
+function To-Int32Unchecked {
+    param([Int64]$Value)
+    $masked = [uint32]($Value -band 0xffffffffL)
+    return [BitConverter]::ToInt32([BitConverter]::GetBytes($masked), 0)
+}
+
+function Get-TokenList {
+    param([string]$Expression)
+    $tokens = [System.Collections.Generic.List[object]]::new()
+    $i = 0
+    while ($i -lt $Expression.Length) {
+        $ch = $Expression[$i]
+        if ([char]::IsWhiteSpace($ch)) { $i++; continue }
+        if ([char]::IsDigit($ch)) {
+            $start = $i
+            while (($i -lt $Expression.Length) -and [char]::IsDigit($Expression[$i])) { $i++ }
+            $text = $Expression.Substring($start, $i - $start)
+            [void]$tokens.Add([pscustomobject]@{ kind = "number"; text = $text; value = [Int64]$text })
+            continue
+        }
+        if (($i + 1 -lt $Expression.Length) -and ($Expression.Substring($i, 2) -eq "<<" -or $Expression.Substring($i, 2) -eq ">>")) {
+            [void]$tokens.Add([pscustomobject]@{ kind = "op"; text = $Expression.Substring($i, 2); value = $null })
+            $i += 2
+            continue
+        }
+        if ("+-^~()&|".IndexOf($ch) -ge 0) {
+            [void]$tokens.Add([pscustomobject]@{ kind = "op"; text = [string]$ch; value = $null })
+            $i++
+            continue
+        }
+        throw "Unsupported character '$ch' in expression: $Expression"
+    }
+    [void]$tokens.Add([pscustomobject]@{ kind = "eof"; text = ""; value = $null })
+    return $tokens.ToArray()
+}
+
+function Peek-Token { return $script:ObfTokens[$script:ObfIndex] }
+function Read-Token { $token = $script:ObfTokens[$script:ObfIndex]; $script:ObfIndex++; return $token }
+function Test-Operator {
+    param([string]$Operator)
+    $token = Peek-Token
+    return $token.kind -eq "op" -and $token.text -eq $Operator
+}
+
+function Parse-Primary {
+    $token = Read-Token
+    if ($token.kind -eq "number") { return To-Int32Unchecked $token.value }
+    if ($token.kind -eq "op" -and $token.text -eq "(") {
+        $value = Parse-OrExpression
+        if (-not (Test-Operator ")")) { throw "Missing ')'" }
+        [void](Read-Token)
+        return $value
+    }
+    throw "Expected number or '(' but got '$($token.text)'"
+}
+
+function Parse-Unary {
+    if (Test-Operator "+") { [void](Read-Token); return Parse-Unary }
+    if (Test-Operator "-") { [void](Read-Token); return To-Int32Unchecked (-[Int64](Parse-Unary)) }
+    if (Test-Operator "~") { [void](Read-Token); return To-Int32Unchecked (-bnot [Int64](Parse-Unary)) }
+    return Parse-Primary
+}
+
+function Parse-AddExpression {
+    $left = Parse-Unary
+    while ((Test-Operator "+") -or (Test-Operator "-")) {
+        $op = (Read-Token).text
+        $right = Parse-Unary
+        if ($op -eq "+") { $left = To-Int32Unchecked ([Int64]$left + [Int64]$right) }
+        else { $left = To-Int32Unchecked ([Int64]$left - [Int64]$right) }
+    }
+    return $left
+}
+
+function Parse-ShiftExpression {
+    $left = Parse-AddExpression
+    while ((Test-Operator "<<") -or (Test-Operator ">>")) {
+        $op = (Read-Token).text
+        $right = Parse-AddExpression
+        $shift = [int]($right -band 31)
+        if ($op -eq "<<") {
+            $left = To-Int32Unchecked ([Int64]$left -shl $shift)
+        } else {
+            $left = To-Int32Unchecked ([int]$left -shr $shift)
+        }
+    }
+    return $left
+}
+
+function Parse-AndExpression {
+    $left = Parse-ShiftExpression
+    while (Test-Operator "&") {
+        [void](Read-Token)
+        $right = Parse-ShiftExpression
+        $left = To-Int32Unchecked ([Int64]$left -band [Int64]$right)
+    }
+    return $left
+}
+
+function Parse-XorExpression {
+    $left = Parse-AndExpression
+    while (Test-Operator "^") {
+        [void](Read-Token)
+        $right = Parse-AndExpression
+        $left = To-Int32Unchecked ([Int64]$left -bxor [Int64]$right)
+    }
+    return $left
+}
+
+function Parse-OrExpression {
+    $left = Parse-XorExpression
+    while (Test-Operator "|") {
+        [void](Read-Token)
+        $right = Parse-XorExpression
+        $left = To-Int32Unchecked ([Int64]$left -bor [Int64]$right)
+    }
+    return $left
+}
+
+function Convert-ExpressionToInt32 {
+    param([string]$Expression)
+    $script:ObfTokens = Get-TokenList $Expression
+    $script:ObfIndex = 0
+    $value = Parse-OrExpression
+    $token = Peek-Token
+    if ($token.kind -ne "eof") { throw "Unexpected token '$($token.text)'" }
+    return $value
+}
+
+function Get-DecoderCalls {
+    param([string]$Text)
+    $needle = $CallPrefix + "("
+    $calls = [System.Collections.Generic.List[object]]::new()
+    $index = 0
+    while ($index -lt $Text.Length) {
+        $start = $Text.IndexOf($needle, $index, [System.StringComparison]::Ordinal)
+        if ($start -lt 0) { break }
+        $exprStart = $start + $needle.Length
+        $depth = 1
+        $i = $exprStart
+        while ($i -lt $Text.Length -and $depth -gt 0) {
+            $ch = $Text[$i]
+            if ($ch -eq '(') { $depth++ }
+            elseif ($ch -eq ')') { $depth-- }
+            $i++
+        }
+        if ($depth -ne 0) { break }
+        $exprEnd = $i - 1
+        $expr = $Text.Substring($exprStart, $exprEnd - $exprStart)
+        $line = 1 + ([regex]::Matches($Text.Substring(0, $start), "`n")).Count
+        $afterCall = $Text.Substring($i, [Math]::Min(128, $Text.Length - $i))
+        $existingAnnotation = $null
+        $annotationMatch = [regex]::Match($afterCall, '^\s*/\*\s*"((?:\\.|[^"\\])*)"\s*\*/')
+        if ($annotationMatch.Success) { $existingAnnotation = $annotationMatch.Groups[1].Value }
+        [void]$calls.Add([pscustomobject]@{
+            start = $start
+            end = $i
+            expression = $expr.Trim()
+            line = $line
+            existingAnnotation = $existingAnnotation
+        })
+        $index = $i
+    }
+    return $calls.ToArray()
+}
+
+function Convert-ToCommentString {
+    param([string]$Value)
+    if ($null -eq $Value) { return "<null>" }
+    $escaped = $Value.Replace("\", "\\").Replace("`r", "\r").Replace("`n", "\n").Replace("`t", "\t").Replace('"', '\"')
+    return $escaped.Replace("*/", "* /")
+}
+
+function Initialize-Decoder {
+    param(
+        [string]$Path,
+        [string[]]$SearchPaths,
+        [string]$TypeName,
+        [string]$MethodName,
+        [string]$GuardFieldName,
+        [int]$GuardValue
+    )
+    $dirs = [System.Collections.Generic.List[string]]::new()
+    Add-ExistingDir $dirs (Split-Path -Parent $Path)
+    foreach ($dir in $SearchPaths) { Add-ExistingDir $dirs $dir }
+    Add-ExistingDir $dirs (Join-Path $RepoRoot "resource\app")
+    Add-ExistingDir $dirs (Join-Path $RepoRoot "resource\app\MelonLoader")
+    Add-ExistingDir $dirs (Join-Path $RepoRoot "resource\app\MelonLoader\Managed")
+    Add-ExistingDir $dirs (Join-Path $RepoRoot "resource\app\MelonLoader\Dependencies\Il2CppAssemblyGenerator\UnityDependencies")
+    Add-ExistingDir $dirs (Join-Path $RepoRoot "resource\app\MelonLoader\Dependencies\Il2CppAssemblyGenerator\Cpp2IL\cpp2il_out")
+
+    $handler = [System.ResolveEventHandler]{
+        param($sender, $eventArgs)
+        $fileName = ($eventArgs.Name -split ',')[0] + ".dll"
+        foreach ($dir in $dirs) {
+            $candidate = Join-Path $dir $fileName
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { return [Reflection.Assembly]::LoadFrom($candidate) }
+        }
+        return $null
+    }
+    [AppDomain]::CurrentDomain.add_AssemblyResolve($handler)
+
+    $assembly = [Reflection.Assembly]::LoadFrom($Path)
+    $type = $assembly.GetType($TypeName, $true)
+    [Runtime.CompilerServices.RuntimeHelpers]::RunClassConstructor($type.TypeHandle)
+    if (-not [string]::IsNullOrWhiteSpace($GuardFieldName)) {
+        $guardField = $type.GetField($GuardFieldName, [Reflection.BindingFlags]'NonPublic,Static,Public')
+        if ($guardField) { $guardField.SetValue($null, $GuardValue) }
+    }
+    $method = $type.GetMethod($MethodName, [Reflection.BindingFlags]'NonPublic,Static,Public')
+    if ($null -eq $method) { throw "Decoder method not found: $TypeName.$MethodName" }
+    return [pscustomobject]@{ assembly = $assembly; type = $type; method = $method; searchPaths = $dirs.ToArray() }
+}
+
+function Invoke-Decoder {
+    param(
+        [object]$Decoder,
+        [int]$Value
+    )
+    try {
+        return [pscustomobject]@{ ok = $true; value = [string]$Decoder.method.Invoke($null, @([int]$Value)); error = $null }
+    } catch [Reflection.TargetInvocationException] {
+        return [pscustomobject]@{ ok = $false; value = $null; error = $_.Exception.InnerException.Message }
+    } catch {
+        return [pscustomobject]@{ ok = $false; value = $null; error = $_.Exception.Message }
+    }
+}
+
+function Invoke-DotnetHostDecoder {
+    param(
+        [int[]]$Values
+    )
+    if ([string]::IsNullOrWhiteSpace($DotnetHostProject)) {
+        $DotnetHostProject = Join-Path $ScriptRoot "StringDecoderHost\StringDecoderHost.csproj"
+    }
+    if (-not (Test-Path -LiteralPath $DotnetHostProject -PathType Leaf)) { throw "DotnetHostProject not found: $DotnetHostProject" }
+    $jsonValues = ConvertTo-Json -InputObject @($Values) -Compress
+    $args = @(
+        "run", "--project", $DotnetHostProject, "--",
+        "--assembly", $AssemblyPath,
+        "--type", $DecoderType,
+        "--method", $DecoderMethod,
+        "--values", $jsonValues
+    )
+    if (-not [string]::IsNullOrWhiteSpace($DecoderGuardField)) {
+        $args += @("--guard-field", $DecoderGuardField, "--guard-value", [string]$DecoderGuardValue)
+    }
+    foreach ($path in $AssemblySearchPath) {
+        if (-not [string]::IsNullOrWhiteSpace($path)) { $args += @("--search-path", $path) }
+    }
+    $output = & dotnet @args 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "StringDecoderHost failed with exit code $LASTEXITCODE`: $($output -join "`n")" }
+    $jsonLine = @($output | Where-Object { $_ -match '^\s*\{' } | Select-Object -Last 1)
+    if (-not $jsonLine) { throw "StringDecoderHost did not return JSON: $($output -join "`n")" }
+    $hostResult = $jsonLine | ConvertFrom-Json
+    if (-not $hostResult.ok) { throw "StringDecoderHost error: $($hostResult.error)" }
+    $map = @{}
+    foreach ($result in @($hostResult.results)) {
+        $map[[string]$result.value] = [pscustomobject]@{ ok = [bool]$result.ok; value = [string]$result.decoded; error = [string]$result.error }
+    }
+    return [pscustomobject]@{ map = $map; searchPaths = @($hostResult.searchPaths) }
+}
+
+if (-not (Test-Path -LiteralPath $AssemblyPath -PathType Leaf)) { throw "AssemblyPath not found: $AssemblyPath" }
+if (-not (Test-Path -LiteralPath $InputDir -PathType Container)) { throw "InputDir not found: $InputDir" }
+$AssemblyPath = (Resolve-Path -LiteralPath $AssemblyPath).Path
+$InputDir = (Resolve-Path -LiteralPath $InputDir).Path
+New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+$OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
+
+$decoder = $null
+$dotnetHostSearchPaths = @()
+if (-not $UseDotnetHost) {
+    $decoder = Initialize-Decoder $AssemblyPath $AssemblySearchPath $DecoderType $DecoderMethod $DecoderGuardField $DecoderGuardValue
+}
+$cache = @{}
+$records = [System.Collections.Generic.List[object]]::new()
+$files = @(Get-ChildItem -LiteralPath $InputDir -Recurse -File -Filter *.cs -ErrorAction SilentlyContinue)
+$annotatedFileCount = 0
+$callCount = 0
+$successCount = 0
+$errorCount = 0
+
+if ($UseDotnetHost) {
+    $valuesForHost = [System.Collections.Generic.List[int]]::new()
+    foreach ($file in $files) {
+        $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+        foreach ($call in @(Get-DecoderCalls $text)) {
+            try { [void]$valuesForHost.Add((Convert-ExpressionToInt32 $call.expression)) } catch { }
+        }
+    }
+    if ($valuesForHost.Count -gt 0) {
+        $hostDecoded = Invoke-DotnetHostDecoder -Values $valuesForHost.ToArray()
+        $cache = $hostDecoded.map
+        $dotnetHostSearchPaths = $hostDecoded.searchPaths
+    }
+}
+
+foreach ($file in $files) {
+    $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+    $calls = @(Get-DecoderCalls $text)
+    if ($calls.Count -eq 0) { continue }
+
+    $relative = $file.FullName.Substring($InputDir.Length).TrimStart('\')
+    $target = Join-Path $OutputDir $relative
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+
+    $builder = [System.Text.StringBuilder]::new()
+    $last = 0
+    foreach ($call in $calls) {
+        [void]$builder.Append($text.Substring($last, $call.end - $last))
+        $callCount++
+        $record = [ordered]@{
+            file = $relative
+            line = $call.line
+            expression = $call.expression
+            value = $null
+            decoded = $null
+            status = "unknown"
+            error = $null
+            decoder = "$DecoderType.$DecoderMethod"
+            callPrefix = $CallPrefix
+            existingAnnotation = $call.existingAnnotation
+        }
+        try {
+            $value = Convert-ExpressionToInt32 $call.expression
+            $record.value = $value
+            $cacheKey = [string]$value
+            if (-not $cache.ContainsKey($cacheKey)) { $cache[$cacheKey] = Invoke-Decoder $decoder $value }
+            $decoded = $cache[$cacheKey]
+            if ($decoded.ok) {
+                $record.decoded = $decoded.value
+                $record.status = "ok"
+                $successCount++
+                if ($null -eq $call.existingAnnotation) {
+                    [void]$builder.Append((' /* "{0}" */' -f (Convert-ToCommentString $decoded.value)))
+                }
+            } else {
+                $record.status = "decode-error"
+                $record.error = $decoded.error
+                $errorCount++
+            }
+        } catch {
+            $record.status = "eval-error"
+            $record.error = $_.Exception.Message
+            $errorCount++
+        }
+        [void]$records.Add([pscustomobject]$record)
+        $last = $call.end
+    }
+    [void]$builder.Append($text.Substring($last))
+    [System.IO.File]::WriteAllText($target, $builder.ToString(), [System.Text.Encoding]::UTF8)
+    $annotatedFileCount++
+}
+
+$jsonPath = Join-Path $OutputDir "string-map.json"
+$manifestPath = Join-Path $OutputDir "manifest.json"
+$reportPath = Join-Path $OutputDir "STRING_ANNOTATION_REPORT.md"
+ConvertTo-Json -InputObject @($records.ToArray()) -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+[pscustomobject]@{
+    generatedAt = (Get-Date).ToString("o")
+    assemblyPath = $AssemblyPath
+    inputDir = $InputDir
+    outputDir = $OutputDir
+    decoderType = $DecoderType
+    decoderMethod = $DecoderMethod
+    callPrefix = $CallPrefix
+    decoderGuardField = $DecoderGuardField
+    decoderGuardValue = $DecoderGuardValue
+    useDotnetHost = [bool]$UseDotnetHost
+    dotnetHostProject = if ($UseDotnetHost) { $DotnetHostProject } else { $null }
+    assemblySearchPaths = if ($UseDotnetHost) { $dotnetHostSearchPaths } else { $decoder.searchPaths }
+    scannedFileCount = $files.Count
+    annotatedFileCount = $annotatedFileCount
+    callCount = $callCount
+    successCount = $successCount
+    errorCount = $errorCount
+    uniqueDecodedValueCount = $cache.Count
+    stringMap = $jsonPath
+    report = $reportPath
+} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+$lines = [System.Collections.Generic.List[string]]::new()
+$lines.Add("# String Annotation Report")
+$lines.Add("")
+$lines.Add("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')")
+$lines.Add("")
+$lines.Add(('- Assembly: `{0}`' -f $AssemblyPath))
+$lines.Add(('- Input: `{0}`' -f $InputDir))
+$lines.Add(('- Output: `{0}`' -f $OutputDir))
+$lines.Add(('- Decoder: `{0}.{1}`' -f $DecoderType, $DecoderMethod))
+$lines.Add(('- Pattern: `{0}(...)`' -f $CallPrefix))
+$lines.Add(('- Dotnet host: `{0}`' -f ([bool]$UseDotnetHost)))
+$lines.Add(('- Calls: `{0}`' -f $callCount))
+$lines.Add(('- Success: `{0}`' -f $successCount))
+$lines.Add(('- Errors: `{0}`' -f $errorCount))
+$lines.Add(('- Annotated files: `{0}`' -f $annotatedFileCount))
+$lines.Add("")
+$lines.Add("## Samples")
+$lines.Add("")
+$lines.Add("| File | Line | Expression | Value | Decoded |")
+$lines.Add("| --- | ---: | --- | ---: | --- |")
+foreach ($record in (@($records | Where-Object { $_.status -eq "ok" } | Select-Object -First 30))) {
+    $decodedText = (Convert-ToCommentString $record.decoded) -replace '\|', '\|'
+    $exprText = $record.expression -replace '\|', '\|'
+    $lines.Add(('| {0} | {1} | `{2}` | {3} | "{4}" |' -f $record.file, $record.line, $exprText, $record.value, $decodedText))
+}
+if ($errorCount -gt 0) {
+    $lines.Add("")
+    $lines.Add("## Errors")
+    $lines.Add("")
+    $lines.Add("| File | Line | Expression | Status | Error |")
+    $lines.Add("| --- | ---: | --- | --- | --- |")
+    foreach ($record in (@($records | Where-Object { $_.status -ne "ok" } | Select-Object -First 50))) {
+        $exprText = $record.expression -replace '\|', '\|'
+        $errorText = ($record.error -replace '\|', '\|') -replace "`r?`n", " "
+        $lines.Add("| $($record.file) | $($record.line) | `$exprText` | $($record.status) | $errorText |")
+    }
+}
+Set-Content -LiteralPath $reportPath -Value $lines -Encoding UTF8
+
+Write-Host "String annotation complete:" -ForegroundColor Green
+Write-Host "  Output: $OutputDir"
+Write-Host "  Manifest: $manifestPath"
+Write-Host "  String map: $jsonPath"
+Write-Host "  Calls: $callCount; success: $successCount; errors: $errorCount"
+

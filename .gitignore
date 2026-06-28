@@ -1,4 +1,7 @@
 ideas/
+resource/
+docs/generated/
+generated/
 **/bin/
 **/obj/
 **/refs/
